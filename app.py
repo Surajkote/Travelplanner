@@ -324,10 +324,36 @@ if generate_btn:
         )
 
     # ── Display ───────────────────────────────────────────────────────────────
+    # ── Currency helpers ───────────────────────────────────────────────────────
+    ci          = final_state.get("currency_info")
     itinerary   = final_state.get("current_itinerary")
     budget_stat = final_state.get("budget_status")
     prefs       = final_state.get("user_prefs")
     weather     = final_state.get("weather_data") or {}
+
+    # user_rate: how many USD per 1 user_currency → to convert USD→user: divide by user_rate
+    user_rate = (ci.exchange_rate if ci and ci.exchange_rate else 1.0)
+    dest_currency = ci.dest_currency if ci else "USD"
+    dest_rate = (ci.dest_rate if ci and ci.dest_rate else 1.0)
+
+    DEST_SYMBOLS = {
+        "USD":"$","EUR":"€","GBP":"£","INR":"₹","JPY":"¥",
+        "CAD":"CA$","AUD":"A$","CNY":"¥","SGD":"S$","AED":"د.إ",
+        "CHF":"Fr","MXN":"MX$","BRL":"R$","THB":"฿","KRW":"₩",
+        "HKD":"HK$","MYR":"RM","IDR":"Rp","VND":"₫","PHP":"₱",
+        "NZD":"NZ$","ZAR":"R","EGP":"E£","TRY":"₺","MAD":"MAD",
+    }
+    dsym = DEST_SYMBOLS.get(dest_currency, dest_currency + " ")
+
+    def to_user(usd: float) -> str:
+        """Convert USD → user currency, formatted."""
+        val = usd / user_rate
+        return f"{symbol}{val:,.0f}"
+
+    def to_dest(usd: float) -> str:
+        """Convert USD → destination currency, formatted."""
+        val = usd / dest_rate
+        return f"{dsym}{val:,.0f}"
 
     if not itinerary:
         st.error("No itinerary was generated. Please try again.")
@@ -338,15 +364,20 @@ if generate_btn:
     if itinerary.destination_highlights:
         st.markdown(f'<div class="highlights">{itinerary.destination_highlights}</div>', unsafe_allow_html=True)
 
+    # Total cost box — shows BOTH user currency AND destination currency
     if budget_stat:
-        orig = budget_stat.total_cost_usd / (prefs.exchange_rate if prefs and prefs.exchange_rate else 1)
         badge = '<span class="bpass">✓ Within Budget</span>' if not budget_stat.is_over_budget else '<span class="bwarn">⚠ Over Budget</span>'
+        total_user = to_user(budget_stat.total_cost_usd)
+        total_dest = to_dest(budget_stat.total_cost_usd)
+        budget_user = to_user(prefs.budget_usd if prefs else budget_stat.total_cost_usd)
+        dest_label = f" / {total_dest} {dest_currency}" if dest_currency != user_currency else ""
         st.markdown(f"""
         <div class="budget-box">
           <div style="font-size:.82rem;color:#94a3b8;margin-bottom:3px">TOTAL ESTIMATED COST</div>
-          <div class="budget-total">${budget_stat.total_cost_usd:,.2f} USD
-            <span style="font-size:.95rem;color:#94a3b8"> / {symbol}{orig:,.0f} {user_currency}</span>
+          <div class="budget-total">{total_user} {user_currency}
+            <span style="font-size:.95rem;color:#94a3b8">{dest_label}</span>
           </div>
+          <div style="font-size:.8rem;color:#64748b;margin-top:4px">Budget: {budget_user} {user_currency}</div>
           {badge}
         </div>""", unsafe_allow_html=True)
 
@@ -372,6 +403,7 @@ if generate_btn:
 
         for act in day.activities:
             tag = '<span class="tag t-out">🌿 Outdoors</span>' if act.is_outdoors else '<span class="tag t-in">🏛 Indoors</span>'
+            cost_str = to_user(act.estimated_cost_usd)
             st.markdown(f"""
             <div class="act-row">
               <div class="act-time">🕐 {act.time_start}–{act.time_end}</div>
@@ -381,7 +413,7 @@ if generate_btn:
                 <div class="act-tip">💡 {act.tips}</div>
                 <div class="act-tags">
                   {tag}
-                  <span class="tag t-cost">💵 ${act.estimated_cost_usd:.0f}</span>
+                  <span class="tag t-cost">{cost_str}</span>
                 </div>
               </div>
             </div>""", unsafe_allow_html=True)

@@ -31,9 +31,11 @@ class TravelPrefs(BaseModel):
 
 class CurrencyInfo(BaseModel):
     user_currency: str
-    exchange_rate: float
+    exchange_rate: float        # how many USD per 1 user_currency unit
     budget_usd: float
-    budget_original: float   # ← was missing before
+    budget_original: float
+    dest_currency: str = "USD"  # currency of the destination country
+    dest_rate: float = 1.0      # how many USD per 1 dest_currency unit
 
 class Activity(BaseModel):
     name: str = Field(description="Name of the activity or place")
@@ -74,7 +76,7 @@ class TravelPlannerState(TypedDict):
     raw_input: str
     user_prefs: Optional[TravelPrefs]
     currency_info: Optional[CurrencyInfo]
-    destination_data: Optional[dict]   # Wikivoyage + Numbeo data
+    destination_data: Optional[dict]   # Wikivoyage + Numbeo + specifics
     weather_data: Optional[dict]       # Open-Meteo per-day forecast
     current_itinerary: Optional[Itinerary]
     budget_status: Optional[BudgetReport]
@@ -192,33 +194,123 @@ def fetch_weather(lat: float, lon: float, start_date: str, end_date: str) -> dic
     except Exception:
         return {}
 
-# ── Wikivoyage scrape ─────────────────────────────────────────────────────────
+# ── Wikivoyage — robust with multiple name attempts + Tavily/Groq fallback ────
+COUNTRY_CURRENCY = {
+    "fr": "EUR", "de": "EUR", "it": "EUR", "es": "EUR", "pt": "EUR",
+    "nl": "EUR", "be": "EUR", "at": "EUR", "gr": "EUR", "fi": "EUR",
+    "gb": "GBP", "jp": "JPY", "in": "INR", "us": "USD", "ca": "CAD",
+    "au": "AUD", "cn": "CNY", "sg": "SGD", "ae": "AED", "ch": "CHF",
+    "mx": "MXN", "br": "BRL", "th": "THB", "id": "IDR", "my": "MYR",
+    "vn": "VND", "kr": "KRW", "hk": "HKD", "tw": "TWD", "ph": "PHP",
+    "nz": "NZD", "za": "ZAR", "eg": "EGP", "tr": "TRY", "ma": "MAD",
+    "np": "NPR", "lk": "LKR", "pk": "PKR", "bd": "BDT",
+}
+
+def _wikivoyage_api(city_key: str) -> str:
+    url = (
+        "https://en.wikivoyage.org/w/api.php"
+        f"?action=query&titles={requests.utils.quote(city_key)}"
+        "&prop=extracts&exintro=true&explaintext=true&format=json&redirects=1"
+    )
+    r = requests.get(url, headers=HEADERS, timeout=8)
+    pages = r.json().get("query", {}).get("pages", {})
+    for page in pages.values():
+        extract = page.get("extract", "")
+        if extract and len(extract) > 80 and "may refer" not in extract[:80]:
+            return extract[:2000]
+    return ""
+
 def fetch_wikivoyage(destination: str) -> str:
-    """Scrape destination overview from Wikivoyage (plain text via API)."""
+    """Try multiple name variants then fall back to Tavily + Groq summary."""
+    raw = destination.strip()
+    city = raw.split(",")[0].strip()
+    # Build a set of candidate keys to try
+    candidates = [
+        city.replace(" ", "_"),
+        city.replace(" ", "%20"),
+        city.title().replace(" ", "_"),
+        city.lower().replace(" ", "_"),
+        raw.replace(",", "").replace(" ", "_"),
+    ]
+    # Also try Wikivoyage search API if direct lookup fails
+    for key in dict.fromkeys(candidates):  # deduplicate while preserving order
+        try:
+            result = _wikivoyage_api(key)
+            if result:
+                return result
+        except Exception:
+            continue
+    # Search-API fallback
     try:
-        city = destination.split(",")[0].strip().replace(" ", "_")
-        url = (
+        search_url = (
             "https://en.wikivoyage.org/w/api.php"
-            f"?action=query&titles={requests.utils.quote(city)}"
-            "&prop=extracts&exintro=true&explaintext=true&format=json"
+            f"?action=query&list=search&srsearch={requests.utils.quote(city)}"
+            "&srnamespace=0&srlimit=3&format=json"
         )
-        r = requests.get(url, headers=HEADERS, timeout=8)
-        data = r.json()
-        pages = data.get("query", {}).get("pages", {})
-        for page in pages.values():
-            extract = page.get("extract", "")
-            if extract and len(extract) > 50:
-                return extract[:2000]  # cap at 2000 chars
+        sr = requests.get(search_url, headers=HEADERS, timeout=8).json()
+        hits = sr.get("query", {}).get("search", [])
+        for hit in hits:
+            title = hit.get("title", "")
+            result = _wikivoyage_api(title.replace(" ", "_"))
+            if result:
+                return result
+    except Exception:
+        pass
+    # Final fallback: Tavily search → Groq summary
+    try:
+        tavily = get_tavily()
+        q = f"travel guide {destination} best attractions food culture tips"
+        res = tavily.search(query=q, max_results=3)
+        raw_text = " ".join(r.get("content", "") for r in res.get("results", []))[:3000]
+        if raw_text.strip():
+            llm = get_llm()
+            summary = llm.invoke([
+                SystemMessage(content="Summarise this travel information into 3 concise paragraphs covering: overview, highlights, practical tips."),
+                HumanMessage(content=raw_text),
+            ])
+            return summary.content[:2000]
     except Exception:
         pass
     return ""
 
+# ── Destination specifics — exact hotel/restaurant/dish names via Tavily ──────
+def fetch_destination_specifics(destination: str, interests: list, budget_usd: float) -> dict:
+    """Use Tavily to get exact hotel names, famous dishes, best restaurants."""
+    try:
+        tavily = get_tavily()
+        daily = budget_usd / max(1, 7)  # rough daily
+        hotel_q = f"best budget hotels in {destination} under {daily:.0f} USD per night names prices 2024"
+        food_q  = f"most famous local food dishes must-eat restaurants {destination} names"
+        h_res = tavily.search(query=hotel_q, max_results=3)
+        f_res = tavily.search(query=food_q,  max_results=3)
+        hotel_text = " | ".join(r.get("content", "")[:300] for r in h_res.get("results", []))
+        food_text  = " | ".join(r.get("content", "")[:300] for r in f_res.get("results", []))
+        return {"hotels": hotel_text[:800], "food": food_text[:800]}
+    except Exception:
+        return {}
+
+# ── Destination currency via Nominatim country_code ───────────────────────────
+def fetch_dest_currency(destination: str) -> tuple[str, float]:
+    """Return (dest_currency_code, USD_per_1_dest_currency)."""
+    try:
+        url = (
+            "https://nominatim.openstreetmap.org/search"
+            f"?q={requests.utils.quote(destination)}&format=json&limit=1&addressdetails=1"
+        )
+        r = requests.get(url, headers=HEADERS, timeout=7)
+        data = r.json()
+        if data:
+            cc = data[0].get("address", {}).get("country_code", "").lower()
+            currency = COUNTRY_CURRENCY.get(cc, "USD")
+            rate = fetch_exchange_rate(currency) if currency != "USD" else 1.0
+            return currency, rate
+    except Exception:
+        pass
+    return "USD", 1.0
+
 # ── Numbeo cost of living ─────────────────────────────────────────────────────
 def fetch_numbeo_costs(destination: str) -> dict:
-    """
-    Scrape Numbeo cost-of-living page for the destination city.
-    Returns dict with meal, hotel, transport estimates in USD.
-    """
+    """Scrape Numbeo cost-of-living; fall back to Tavily if scrape fails."""
     try:
         city = destination.split(",")[0].strip().replace(" ", "+")
         url = f"https://www.numbeo.com/cost-of-living/in/{city}"
@@ -245,13 +337,11 @@ def fetch_numbeo_costs(destination: str) -> dict:
         if hotel:      costs["hotel_per_night_usd"] = hotel
         if transport:  costs["local_transport_usd"]  = transport
 
-        # Fallback via Tavily if scrape got nothing
         if not costs:
             tavily = get_tavily()
-            q = f"average cost of living per day tourist {destination} USD 2024 hotel meal transport"
+            q = f"average tourist daily cost {destination} USD 2024 hotel meal transport"
             res = tavily.search(query=q, max_results=2)
-            summary = " ".join(r.get("content", "") for r in res.get("results", []))
-            costs["tavily_summary"] = summary[:500]
+            costs["tavily_summary"] = " ".join(r.get("content", "") for r in res.get("results", []))[:500]
 
         return costs
     except Exception as e:
@@ -268,12 +358,16 @@ def currency_resolver(state: TravelPlannerState) -> dict:
         return {}
     rate = fetch_exchange_rate(ci.user_currency)
     budget_usd = ci.budget_original * rate
+    # Destination currency will be filled after input_parser runs;
+    # store placeholder here, updated in destination_researcher.
     return {
         "currency_info": CurrencyInfo(
             user_currency=ci.user_currency,
             exchange_rate=rate,
             budget_usd=round(budget_usd, 2),
             budget_original=ci.budget_original,
+            dest_currency=ci.dest_currency if ci.dest_currency else "USD",
+            dest_rate=ci.dest_rate if ci.dest_rate else 1.0,
         )
     }
 
@@ -310,16 +404,33 @@ Set:
         "all_validators_passed": False,
     }
 
-# Node 3 — destination_researcher (Wikivoyage + Numbeo)
+# Node 3 — destination_researcher (Wikivoyage + Numbeo + specifics + dest currency)
 def destination_researcher(state: TravelPlannerState) -> dict:
-    dest = state["user_prefs"].destination
-    wiki = fetch_wikivoyage(dest)
-    numbeo = fetch_numbeo_costs(dest)
+    dest  = state["user_prefs"].destination
+    prefs = state["user_prefs"]
+    ci    = state.get("currency_info")
+
+    wiki     = fetch_wikivoyage(dest)
+    numbeo   = fetch_numbeo_costs(dest)
+    specifics= fetch_destination_specifics(dest, prefs.interests, prefs.budget_usd)
+    dest_cur, dest_rate = fetch_dest_currency(dest)
+
+    # Update currency_info with destination currency
+    updated_ci = CurrencyInfo(
+        user_currency=ci.user_currency if ci else "USD",
+        exchange_rate=ci.exchange_rate if ci else 1.0,
+        budget_usd=ci.budget_usd if ci else prefs.budget_usd,
+        budget_original=ci.budget_original if ci else prefs.budget_usd,
+        dest_currency=dest_cur,
+        dest_rate=dest_rate,
+    )
     return {
+        "currency_info": updated_ci,
         "destination_data": {
             "wikivoyage": wiki,
             "numbeo": numbeo,
-        }
+            "specifics": specifics,
+        },
     }
 
 # Node 4 — weather_fetcher (Open-Meteo with actual trip dates)
@@ -352,41 +463,56 @@ def planner(state: TravelPlannerState) -> dict:
         )
     weather_text = "\n".join(weather_lines) if weather_lines else "No forecast available."
 
+    specifics    = dest_data.get("specifics", {})
+    hotels_text  = specifics.get("hotels", "")[:600]
+    food_text    = specifics.get("food",   "")[:600]
+
     system_msg = (
         "You are a world-class travel itinerary planner. "
-        "Use the provided real destination data, cost estimates, and weather forecast strictly. "
-        "All costs must be in USD. Plan days starting from 08:00."
+        "Use ONLY the real data provided below — Wikivoyage overview, Numbeo cost benchmarks, "
+        "exact hotel names and famous dishes from Tavily search, and the Open-Meteo weather forecast. "
+        "Never use generic placeholders like 'local hotel' or 'try local cuisine'. "
+        "Always name the specific hotel, dish, and restaurant. All costs in USD."
     )
     user_msg = f"""
 Create a {prefs.days}-day itinerary for {prefs.destination}.
 Trip: {prefs.start_date} → {prefs.end_date}
 Total budget: ${prefs.budget_usd:.2f} USD
+Interests: {', '.join(prefs.interests)}
 
 === DESTINATION OVERVIEW (Wikivoyage) ===
 {wiki_text}
 
-=== COST OF LIVING (Numbeo) ===
+=== COST OF LIVING BENCHMARKS (Numbeo) ===
 {numbeo_text}
 
-=== WEATHER FORECAST FOR TRIP DATES (Open-Meteo) ===
+=== REAL HOTELS WITH NAMES & PRICES (Tavily) ===
+{hotels_text}
+Instruction: Use the actual hotel names listed above. Pick one specific hotel per day that fits the budget.
+
+=== FAMOUS LOCAL DISHES & RESTAURANTS (Tavily) ===
+{food_text}
+Instruction: Name the specific dish (e.g. Croissant at Du Pain et des Idées) and the restaurant.
+
+=== WEATHER FORECAST FOR ACTUAL TRIP DATES (Open-Meteo) ===
 {weather_text}
 
 Rules:
-- Keep TOTAL cost under ${prefs.budget_usd:.2f}
-- 3-4 activities per day with realistic HH:MM start/end times
-- Match each day's date to the actual calendar date starting {prefs.start_date}
-- Use Numbeo cost data for realistic accommodation/food estimates
-- If rain > 10mm, prefer indoor activities on that day
-- Add a weather_note per day from the forecast above
-- Interests to focus on: {', '.join(prefs.interests)}
+- Keep TOTAL cost under ${prefs.budget_usd:.2f} USD
+- 3-4 activities per day with HH:MM start/end times (start at 08:00)
+- Each day date must match calendar starting {prefs.start_date}
+- If rain > 10mm on a day, plan indoor activities
+- accommodation_name must be a real hotel name, not 'budget hotel'
+- food_cost_usd must reflect real Numbeo meal prices
+- Mention specific famous dishes in tips
 """
     if iteration > 0:
         b_issues = "\n".join((state["budget_status"].itemized_overages if state.get("budget_status") else []))
         v_issues = "\n".join(f"Day {v.day}: {v.issue}" for v in state.get("constraint_violations", []))
-        user_msg += f"\n\n⚠️ REVISE — fix these violations from the last attempt:\n"
+        user_msg += "\n\n⚠️ REVISE — fix these specific violations:\n"
         if b_issues: user_msg += f"BUDGET:\n{b_issues}\n"
         if v_issues: user_msg += f"CONSTRAINTS:\n{v_issues}\n"
-        system_msg += " Be very precise in reducing costs and fixing timing conflicts."
+        system_msg += " Reduce costs precisely and fix timing conflicts."
 
     itinerary = structured_llm.invoke([SystemMessage(content=system_msg), HumanMessage(content=user_msg)])
     return {"current_itinerary": itinerary, "iteration": iteration + 1}
