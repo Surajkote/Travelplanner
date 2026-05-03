@@ -1,5 +1,6 @@
 langchain
 langchain-groq
+langchain-community
 langgraph
 pydantic>=2.0.0
 streamlit
@@ -7,3 +8,4 @@ python-dotenv
 requests
 pillow
 grandalf
+tavily-python
