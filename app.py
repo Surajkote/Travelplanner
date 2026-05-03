@@ -425,10 +425,10 @@ if generate_btn:
 
         st.markdown(f"""
           <div class="cost-bar">
-            <div class="chip">🏨 Hotel <span>${acc:.0f}</span></div>
-            <div class="chip">🍽 Food <span>${food:.0f}</span></div>
-            <div class="chip">🎭 Activities <span>${acts:.0f}</span></div>
-            <div class="chip">📊 Day Total <span>${tot:.0f}</span></div>
+            <div class="chip">🏨 Hotel <span>{to_user(acc)}</span></div>
+            <div class="chip">🍽 Food <span>{to_user(food)}</span></div>
+            <div class="chip">🎭 Activities <span>{to_user(acts)}</span></div>
+            <div class="chip">📊 Day Total <span>{to_user(tot)}</span></div>
           </div>
         </div>""", unsafe_allow_html=True)
 

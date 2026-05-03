@@ -469,16 +469,20 @@ def planner(state: TravelPlannerState) -> dict:
 
     system_msg = (
         "You are a world-class travel itinerary planner. "
-        "Use ONLY the real data provided below — Wikivoyage overview, Numbeo cost benchmarks, "
-        "exact hotel names and famous dishes from Tavily search, and the Open-Meteo weather forecast. "
-        "Never use generic placeholders like 'local hotel' or 'try local cuisine'. "
-        "Always name the specific hotel, dish, and restaurant. All costs in USD."
+        "Your job is to plan a COMPLETE, realistic day-by-day itinerary that fills the entire day from 08:00 to 21:00. "
+        "A day must have 4-6 timed activities covering the full waking hours. "
+        "CRITICAL: Do NOT plan only around interests. Interests guide the theme, but every famous landmark, "
+        "iconic attraction, must-see sight, and cultural experience of the destination MUST be included. "
+        "Fill each day as a real tourist would — morning sightseeing, afternoon museums/landmarks, evening dining/culture. "
+        "Use ONLY real data from the sections below. Never use vague placeholders like 'local hotel', "
+        "'try local food', or 'visit local area'. Name every place, dish, and hotel specifically. "
+        "All costs in USD."
     )
     user_msg = f"""
-Create a {prefs.days}-day itinerary for {prefs.destination}.
+Create a COMPLETE {prefs.days}-day itinerary for {prefs.destination}.
 Trip: {prefs.start_date} → {prefs.end_date}
 Total budget: ${prefs.budget_usd:.2f} USD
-Interests: {', '.join(prefs.interests)}
+Traveller interests (use as theme, NOT as the only activities): {', '.join(prefs.interests) if prefs.interests else 'General sightseeing'}
 
 === DESTINATION OVERVIEW (Wikivoyage) ===
 {wiki_text}
@@ -488,24 +492,26 @@ Interests: {', '.join(prefs.interests)}
 
 === REAL HOTELS WITH NAMES & PRICES (Tavily) ===
 {hotels_text}
-Instruction: Use the actual hotel names listed above. Pick one specific hotel per day that fits the budget.
 
 === FAMOUS LOCAL DISHES & RESTAURANTS (Tavily) ===
 {food_text}
-Instruction: Name the specific dish (e.g. Croissant at Du Pain et des Idées) and the restaurant.
 
-=== WEATHER FORECAST FOR ACTUAL TRIP DATES (Open-Meteo) ===
+=== WEATHER FORECAST (Open-Meteo) ===
 {weather_text}
 
-Rules:
-- Keep TOTAL cost under ${prefs.budget_usd:.2f} USD
-- 3-4 activities per day with HH:MM start/end times (start at 08:00)
-- Each day date must match calendar starting {prefs.start_date}
-- If rain > 10mm on a day, plan indoor activities
-- accommodation_name must be a real hotel name, not 'budget hotel'
-- food_cost_usd must reflect real Numbeo meal prices
-- Mention specific famous dishes in tips
+MANDATORY RULES — follow every single one:
+1. Each day MUST have 4-6 activities spanning 08:00 to 21:00. Do NOT leave gaps longer than 1 hour.
+2. Fill every hour purposefully: morning = iconic landmarks/sights, afternoon = museums/culture/parks, evening = famous restaurant/food district/night market.
+3. ALWAYS include the top 3-5 must-see attractions of {prefs.destination} spread across the trip (e.g. for Paris: Eiffel Tower, Louvre, Notre-Dame, Montmartre, Versailles).
+4. accommodation_name MUST be a real, specific hotel name from the Tavily data above — never 'budget hotel' or 'hostel'.
+5. Every activity's 'name' must be a real place, e.g. 'Eiffel Tower' not 'visit tower'.
+6. Every tip must mention a specific dish by name (e.g. 'Try Croissant at Boulangerie Julien nearby').
+7. Keep TOTAL cost under ${prefs.budget_usd:.2f} USD across all days.
+8. Each day's date must follow the calendar starting {prefs.start_date}.
+9. If rain > 10mm on a day, include more indoor activities (museums, galleries, cafes) but still fill the whole day.
+10. Use Numbeo benchmarks for realistic cost estimates.
 """
+
     if iteration > 0:
         b_issues = "\n".join((state["budget_status"].itemized_overages if state.get("budget_status") else []))
         v_issues = "\n".join(f"Day {v.day}: {v.issue}" for v in state.get("constraint_violations", []))
